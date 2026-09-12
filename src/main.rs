@@ -1,5 +1,4 @@
-mod record;
-mod log;
+use eventstore::record;
 
 fn main() {
     let payload = b"Hello, world";

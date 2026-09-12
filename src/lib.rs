@@ -1,2 +1,3 @@
+mod error;
 mod log;
-mod record;
+pub mod record;
