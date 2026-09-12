@@ -1,10 +1,6 @@
+use crate::error::{CorruptReason, Result, StoreError};
 use crate::record::checksum;
-use std::{
-    fs::File,
-    io::{self, Error, ErrorKind, Write},
-    os::unix::fs::FileExt,
-    path::Path,
-};
+use std::{fs::File, io::Write, os::unix::fs::FileExt, path::Path};
 
 struct Log {
     file: File,
@@ -12,7 +8,7 @@ struct Log {
 }
 
 impl Log {
-    pub fn open(file_path: impl AsRef<Path>) -> std::io::Result<Self> {
+    pub fn open(file_path: impl AsRef<Path>) -> Result<Self> {
         let file = File::options()
             .create(true)
             .read(true)
@@ -24,10 +20,11 @@ impl Log {
         Ok(Log { file, write_offset })
     }
 
-    pub fn append(&mut self, bytes: &[u8]) -> std::io::Result<u64> {
+    pub fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         let record_offset = self.write_offset;
 
-        let len = u32::try_from(bytes.len()).map_err(io::Error::other)?;
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| StoreError::PayloadTooLarge { len: bytes.len() })?;
         let len_bytes = len.to_le_bytes();
 
         let crc = checksum(&len_bytes, bytes);
@@ -45,7 +42,7 @@ impl Log {
         Ok(record_offset)
     }
 
-    pub fn read_at(&self, offset: u64) -> io::Result<Vec<u8>> {
+    pub fn read_at(&self, offset: u64) -> Result<Vec<u8>> {
         self.check_file_space(offset, 8)?;
 
         let mut buf = [0u8; 8];
@@ -59,31 +56,36 @@ impl Log {
         let mut content_buf = vec![0u8; len as usize];
         self.file.read_exact_at(&mut content_buf, offset + 8)?;
 
-        Self::check_crc(&buf[0..4], &content_buf, crc)?;
+        Self::check_crc(&buf[0..4], &content_buf, crc, offset)?;
 
         Ok(content_buf)
     }
 
-    fn check_file_space(&self, start: u64, length: u64) -> std::io::Result<()> {
+    fn check_file_space(&self, start: u64, length: u64) -> Result<()> {
         let Some(max_offset) = start.checked_add(length) else {
-            return Err(Error::new(ErrorKind::InvalidData, "length too long"));
+            return Err(StoreError::PayloadTooLarge {
+                len: length as usize,
+            });
         };
 
         if self.write_offset >= max_offset {
             Ok(())
         } else {
-            Err(Error::new(
-                ErrorKind::InvalidData,
-                "trying to read past EOF",
-            ))
+            Err(StoreError::OffsetOutOfRange {
+                offset: start,
+                log_len: self.write_offset,
+            })
         }
     }
 
-    fn check_crc(len_bytes: &[u8], bytes: &[u8], crc: u32) -> std::io::Result<()> {
+    fn check_crc(len_bytes: &[u8], bytes: &[u8], crc: u32, offset: u64) -> Result<()> {
         if crc == checksum(len_bytes, bytes) {
             Ok(())
         } else {
-            Err(Error::new(ErrorKind::InvalidData, "crc mismatch"))
+            Err(StoreError::Corrupt {
+                offset,
+                reason: CorruptReason::ChecksumMismatch,
+            })
         }
     }
 }
@@ -98,7 +100,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn append_twice_gives_correct_offsets() -> std::io::Result<()> {
+        fn append_twice_gives_correct_offsets() -> Result<()> {
             let temp_dir = tempfile::tempdir()?;
             let mut log = Log::open(temp_dir.path().join("file_path"))?;
 
@@ -114,7 +116,7 @@ mod tests {
         }
 
         #[test]
-        fn after_reopen_gives_correct_data_and_offset() -> std::io::Result<()> {
+        fn after_reopen_gives_correct_data_and_offset() -> Result<()> {
             let temp_dir = tempfile::tempdir()?;
             let file_path = temp_dir.path().join("file_path");
 
@@ -138,7 +140,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn correct_record() -> std::io::Result<()> {
+        fn correct_record() -> Result<()> {
             let temp_dir = tempfile::tempdir()?;
             let mut log = Log::open(temp_dir.path().join("file_path"))?;
             let data = b"payload";
@@ -155,7 +157,7 @@ mod tests {
         }
 
         #[test]
-        fn corrupted_len_record_returns_error() -> std::io::Result<()> {
+        fn corrupted_len_record_returns_error() -> Result<()> {
             let (log, _temp_dir) = build_and_corrupt_at(0)?;
 
             assert!(log.read_at(0).is_err());
@@ -164,7 +166,7 @@ mod tests {
         }
 
         #[test]
-        fn corrupted_crc_record_returns_error() -> std::io::Result<()> {
+        fn corrupted_crc_record_returns_error() -> Result<()> {
             let (log, _temp_dir) = build_and_corrupt_at(4)?;
 
             assert!(log.read_at(0).is_err());
@@ -173,7 +175,7 @@ mod tests {
         }
 
         #[test]
-        fn corrupted_content_record_returns_error() -> std::io::Result<()> {
+        fn corrupted_content_record_returns_error() -> Result<()> {
             let (log, _temp_dir) = build_and_corrupt_at(8)?;
 
             assert!(log.read_at(0).is_err());
@@ -181,7 +183,7 @@ mod tests {
             Ok(())
         }
 
-        fn build_and_corrupt_at(offset: u64) -> std::io::Result<(Log, tempfile::TempDir)> {
+        fn build_and_corrupt_at(offset: u64) -> Result<(Log, tempfile::TempDir)> {
             let temp_dir = tempfile::tempdir()?;
             let file_path = temp_dir.path().join("file_path");
             let mut log = Log::open(&file_path)?;
