@@ -2,7 +2,7 @@ use crate::error::{CorruptReason, Result, StoreError};
 use crate::record::checksum;
 use std::{fs::File, io::Write, os::unix::fs::FileExt, path::Path};
 
-struct Log {
+pub struct Log {
     file: File,
     write_offset: u64,
 }
@@ -43,7 +43,12 @@ impl Log {
     }
 
     pub fn read_at(&self, offset: u64) -> Result<Vec<u8>> {
-        self.check_file_space(offset, 8)?;
+        if !self.is_within_log(offset, 8) {
+            return Err(StoreError::OffsetOutOfRange {
+                offset,
+                log_len: self.write_offset,
+            });
+        }
 
         let mut buf = [0u8; 8];
         self.file.read_exact_at(&mut buf, offset)?;
@@ -51,7 +56,12 @@ impl Log {
         let len = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let crc = u32::from_le_bytes(buf[4..8].try_into().unwrap());
 
-        self.check_file_space(offset + 8, len as u64)?;
+        if !self.is_within_log(offset + 8, len as u64) {
+            return Err(StoreError::Corrupt {
+                offset,
+                reason: CorruptReason::LengthOutOfRange,
+            });
+        }
 
         let mut content_buf = vec![0u8; len as usize];
         self.file.read_exact_at(&mut content_buf, offset + 8)?;
@@ -61,21 +71,12 @@ impl Log {
         Ok(content_buf)
     }
 
-    fn check_file_space(&self, start: u64, length: u64) -> Result<()> {
+    fn is_within_log(&self, start: u64, length: u64) -> bool {
         let Some(max_offset) = start.checked_add(length) else {
-            return Err(StoreError::PayloadTooLarge {
-                len: length as usize,
-            });
+            return false;
         };
 
-        if self.write_offset >= max_offset {
-            Ok(())
-        } else {
-            Err(StoreError::OffsetOutOfRange {
-                offset: start,
-                log_len: self.write_offset,
-            })
-        }
+        self.write_offset >= max_offset
     }
 
     fn check_crc(len_bytes: &[u8], bytes: &[u8], crc: u32, offset: u64) -> Result<()> {
@@ -160,7 +161,18 @@ mod tests {
         fn corrupted_len_record_returns_error() -> Result<()> {
             let (log, _temp_dir) = build_and_corrupt_at(0)?;
 
-            assert!(log.read_at(0).is_err());
+            let err = log.read_at(0).unwrap_err();
+
+            assert!(
+                matches!(
+                    err,
+                    StoreError::Corrupt {
+                        offset: 0,
+                        reason: CorruptReason::LengthOutOfRange
+                    }
+                ),
+                "unexpected error: {err:?}"
+            );
 
             Ok(())
         }
@@ -169,7 +181,18 @@ mod tests {
         fn corrupted_crc_record_returns_error() -> Result<()> {
             let (log, _temp_dir) = build_and_corrupt_at(4)?;
 
-            assert!(log.read_at(0).is_err());
+            let err = log.read_at(0).unwrap_err();
+
+            assert!(
+                matches!(
+                    err,
+                    StoreError::Corrupt {
+                        offset: 0,
+                        reason: CorruptReason::ChecksumMismatch
+                    }
+                ),
+                "unexpected error: {err:?}"
+            );
 
             Ok(())
         }
@@ -178,7 +201,39 @@ mod tests {
         fn corrupted_content_record_returns_error() -> Result<()> {
             let (log, _temp_dir) = build_and_corrupt_at(8)?;
 
-            assert!(log.read_at(0).is_err());
+            let err = log.read_at(0).unwrap_err();
+
+            assert!(
+                matches!(
+                    err,
+                    StoreError::Corrupt {
+                        offset: 0,
+                        reason: CorruptReason::ChecksumMismatch
+                    }
+                ),
+                "unexpected error: {err:?}"
+            );
+
+            Ok(())
+        }
+
+        #[test]
+        fn offset_out_of_range_returns_error() -> Result<()> {
+            let temp_dir = tempfile::tempdir()?;
+            let log = Log::open(temp_dir.path().join("file_path"))?;
+
+            let err = log.read_at(8).unwrap_err();
+
+            assert!(
+                matches!(
+                    err,
+                    StoreError::OffsetOutOfRange {
+                        offset: 8,
+                        log_len: 0
+                    }
+                ),
+                "unexpected error: {err:?}"
+            );
 
             Ok(())
         }

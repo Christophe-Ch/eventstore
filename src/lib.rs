@@ -1,3 +1,3 @@
-mod error;
-mod log;
+pub mod error;
+pub mod log;
 pub mod record;

@@ -53,6 +53,23 @@ Order matters, and it is deliberately paranoid:
 5. Recompute the checksum over the header's length bytes and the payload; compare.
 6. Only then return the payload.
 
+**Steps 1 and 3 are the same arithmetic and mean different things.** Step 1 judges an
+argument: the caller asked for an offset that does not address a record header inside this
+log. Nothing on disk is wrong, and the error says so — an out-of-range offset, reported
+with the log's length.
+
+Step 3 judges bytes that came off the disk. The offset was valid, the header was read, and
+the length it declares runs past the end of the log. The caller did nothing wrong; the
+record is not trustworthy. That is reported as **corruption at the record's offset**, never
+as a range error. This is the check the CRC-covers-the-length decision above exists to back
+up: a header torn mid-write can hold a plausible but wrong length, and this is where that
+shows up before anything is allocated.
+
+The distinction is not cosmetic. Recovery only gets to ask "torn tail, or real damage?"
+about records it has already classified as corrupt. Reporting a lying length as a range
+error would drop the record out of that decision entirely, and the scan would have no way
+to tell a truncated final write from a severed log.
+
 ## Recovery
 
 Append-only means damage can only occur where writing stopped. So a record that fails
