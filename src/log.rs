@@ -1,6 +1,8 @@
 use crate::error::{CorruptReason, Result, StoreError};
-use crate::record::checksum;
+use crate::record::{self, checksum};
 use std::{fs::File, io::Write, os::unix::fs::FileExt, path::Path};
+
+const HEADER_LEN: u64 = 8;
 
 pub struct Log {
     file: File,
@@ -30,7 +32,7 @@ impl Log {
         let crc = checksum(&len_bytes, bytes);
         let crc_bytes = crc.to_le_bytes();
 
-        let mut to_write: Vec<u8> = Vec::with_capacity(8 + bytes.len());
+        let mut to_write: Vec<u8> = Vec::with_capacity(HEADER_LEN as usize + bytes.len());
         to_write.extend_from_slice(&len_bytes);
         to_write.extend_from_slice(&crc_bytes);
         to_write.extend_from_slice(bytes);
@@ -43,20 +45,20 @@ impl Log {
     }
 
     pub fn read_at(&self, offset: u64) -> Result<Vec<u8>> {
-        if !self.is_within_log(offset, 8) {
+        if !self.is_within_log(offset, HEADER_LEN) {
             return Err(StoreError::OffsetOutOfRange {
                 offset,
                 log_len: self.write_offset,
             });
         }
 
-        let mut buf = [0u8; 8];
+        let mut buf = [0u8; HEADER_LEN as usize];
         self.file.read_exact_at(&mut buf, offset)?;
 
         let len = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let crc = u32::from_le_bytes(buf[4..8].try_into().unwrap());
 
-        if !self.is_within_log(offset + 8, len as u64) {
+        if !self.is_within_log(offset + HEADER_LEN, len as u64) {
             return Err(StoreError::Corrupt {
                 offset,
                 reason: CorruptReason::LengthOutOfRange,
@@ -64,11 +66,25 @@ impl Log {
         }
 
         let mut content_buf = vec![0u8; len as usize];
-        self.file.read_exact_at(&mut content_buf, offset + 8)?;
+        self.file
+            .read_exact_at(&mut content_buf, offset + HEADER_LEN)?;
 
-        Self::check_crc(&buf[0..4], &content_buf, crc, offset)?;
+        if !record::crc_matches(&buf[0..4], &content_buf, crc) {
+            return Err(StoreError::Corrupt {
+                offset,
+                reason: CorruptReason::ChecksumMismatch,
+            });
+        }
 
         Ok(content_buf)
+    }
+
+    pub fn iter(&self) -> RecordIter<'_> {
+        RecordIter {
+            log: self,
+            cursor: 0,
+            done: false,
+        }
     }
 
     fn is_within_log(&self, start: u64, length: u64) -> bool {
@@ -78,15 +94,33 @@ impl Log {
 
         self.write_offset >= max_offset
     }
+}
 
-    fn check_crc(len_bytes: &[u8], bytes: &[u8], crc: u32, offset: u64) -> Result<()> {
-        if crc == checksum(len_bytes, bytes) {
-            Ok(())
-        } else {
-            Err(StoreError::Corrupt {
-                offset,
-                reason: CorruptReason::ChecksumMismatch,
-            })
+pub struct RecordIter<'a> {
+    log: &'a Log,
+    cursor: u64,
+    done: bool,
+}
+
+impl Iterator for RecordIter<'_> {
+    type Item = Result<(u64, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.cursor >= self.log.write_offset {
+            return None;
+        }
+
+        let record_offset = self.cursor;
+
+        match self.log.read_at(self.cursor) {
+            Err(err) => {
+                self.done = true;
+                Some(Err(err))
+            }
+            Ok(content) => {
+                self.cursor += HEADER_LEN + content.len() as u64;
+                Some(Ok((record_offset, content)))
+            }
         }
     }
 }
@@ -94,6 +128,36 @@ impl Log {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build(records: &[&[u8]]) -> Result<(Log, tempfile::TempDir, std::path::PathBuf)> {
+        let temp_dir = tempfile::tempdir()?;
+        let file_path = temp_dir.path().join("file_path");
+        let mut log = Log::open(&file_path)?;
+
+        for &record in records {
+            log.append(record)?;
+        }
+
+        Ok((log, temp_dir, file_path))
+    }
+
+    fn build_and_corrupt_at(offset: u64) -> Result<(Log, tempfile::TempDir)> {
+        build_and_corrupt_at_with(offset, &[b"payload"])
+    }
+
+    fn build_and_corrupt_at_with(
+        offset: u64,
+        records: &[&[u8]],
+    ) -> Result<(Log, tempfile::TempDir)> {
+        let (log, temp_dir, file_path) = build(records)?;
+
+        let file = File::options().read(true).write(true).open(&file_path)?;
+        let mut to_corrupt = [0];
+        file.read_exact_at(&mut to_corrupt, offset)?;
+        file.write_at(&[to_corrupt[0] ^ 0xFF], offset)?;
+
+        Ok((log, temp_dir))
+    }
 
     mod append {
         use std::fs::metadata;
@@ -111,7 +175,7 @@ mod tests {
             assert_eq!(offset, 0);
 
             let offset = log.append(bytes)?;
-            assert_eq!(offset, (8 + bytes.len()) as u64);
+            assert_eq!(offset, HEADER_LEN + bytes.len() as u64);
 
             Ok(())
         }
@@ -237,20 +301,66 @@ mod tests {
 
             Ok(())
         }
+    }
 
-        fn build_and_corrupt_at(offset: u64) -> Result<(Log, tempfile::TempDir)> {
-            let temp_dir = tempfile::tempdir()?;
-            let file_path = temp_dir.path().join("file_path");
-            let mut log = Log::open(&file_path)?;
-            let data = b"payload";
-            log.append(data)?;
+    mod iter {
+        use super::*;
 
-            let file = File::options().read(true).write(true).open(&file_path)?;
-            let mut to_corrupt = [0];
-            file.read_exact_at(&mut to_corrupt, offset)?;
-            file.write_at(&[to_corrupt[0] ^ 0xFF], offset)?;
+        #[test]
+        fn over_empty_log_returns_none() -> Result<()> {
+            let (log, _temp_dir, _) = build(&[])?;
 
-            Ok((log, temp_dir))
+            assert!(log.iter().next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        fn over_3_records_returns_correct_contents() -> Result<()> {
+            let records: &[&[u8]] = &[b"first", b"second", b"third"];
+            let offsets = [0, 13, 27];
+            let (log, _temp_dir, _) = build(records)?;
+
+            let mut iter = log.iter();
+            for (expected_record, expected_offset) in records.iter().zip(offsets) {
+                let (offset, record) = iter.next().expect("iterator ended early")?;
+                assert_eq!(record, *expected_record);
+                assert_eq!(offset, expected_offset);
+            }
+
+            let next = iter.next();
+            assert!(next.is_none(), "unexpected next: {next:?}");
+
+            Ok(())
+        }
+
+        #[test]
+        fn over_records_with_2nd_corrupted_returns_valid_then_error() -> Result<()> {
+            let records: &[&[u8]] = &[b"first", b"second"];
+            let (log, _temp_dir) = build_and_corrupt_at_with(17, records)?;
+            let mut iter = log.iter();
+
+            assert_eq!(
+                iter.next().expect("iterator ended early")?,
+                (0u64, b"first".to_vec())
+            );
+
+            let err = iter.next().expect("expected error").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StoreError::Corrupt {
+                        offset: 13,
+                        reason: CorruptReason::ChecksumMismatch
+                    }
+                ),
+                "unexpected error: {err:?}"
+            );
+
+            let next = iter.next();
+            assert!(next.is_none(), "unexpected next: {next:?}");
+
+            Ok(())
         }
     }
 }

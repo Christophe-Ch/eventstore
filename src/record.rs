@@ -11,6 +11,10 @@ pub fn checksum(len_bytes: &[u8], bytes: &[u8]) -> u32 {
     digest.finalize()
 }
 
+pub fn crc_matches(len_bytes: &[u8], bytes: &[u8], crc: u32) -> bool {
+    crc == checksum(len_bytes, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
