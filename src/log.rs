@@ -4,6 +4,7 @@ use std::{fs::File, io::Write, os::unix::fs::FileExt, path::Path};
 
 const HEADER_LEN: u64 = 8;
 
+#[derive(Debug)]
 pub struct Log {
     file: File,
     write_offset: u64,
@@ -19,7 +20,10 @@ impl Log {
 
         let write_offset = file.metadata()?.len();
 
-        Ok(Log { file, write_offset })
+        let mut log = Log { file, write_offset };
+        log.recover_torn_tail()?;
+
+        Ok(log)
     }
 
     pub fn append(&mut self, bytes: &[u8]) -> Result<u64> {
@@ -94,6 +98,36 @@ impl Log {
 
         self.write_offset >= max_offset
     }
+
+    fn recover_torn_tail(&mut self) -> Result<()> {
+        let mut iter = self.iter();
+
+        let decision: Option<u64> = loop {
+            match iter.next() {
+                Some(Ok(_)) => continue,
+                Some(Err(
+                    StoreError::Corrupt {
+                        offset,
+                        reason: CorruptReason::LengthOutOfRange,
+                    }
+                    | StoreError::OffsetOutOfRange { offset, .. },
+                )) => {
+                    break Some(offset);
+                }
+                Some(Err(err)) => {
+                    return Err(err);
+                }
+                None => break None,
+            }
+        };
+
+        if let Some(offset) = decision {
+            self.write_offset = offset;
+            self.file.set_len(offset)?;
+        }
+
+        Ok(())
+    }
 }
 
 pub struct RecordIter<'a> {
@@ -127,6 +161,8 @@ impl Iterator for RecordIter<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::path;
+
     use super::*;
 
     fn build(records: &[&[u8]]) -> Result<(Log, tempfile::TempDir, std::path::PathBuf)> {
@@ -141,14 +177,14 @@ mod tests {
         Ok((log, temp_dir, file_path))
     }
 
-    fn build_and_corrupt_at(offset: u64) -> Result<(Log, tempfile::TempDir)> {
+    fn build_and_corrupt_at(offset: u64) -> Result<(Log, tempfile::TempDir, path::PathBuf)> {
         build_and_corrupt_at_with(offset, &[b"payload"])
     }
 
     fn build_and_corrupt_at_with(
         offset: u64,
         records: &[&[u8]],
-    ) -> Result<(Log, tempfile::TempDir)> {
+    ) -> Result<(Log, tempfile::TempDir, path::PathBuf)> {
         let (log, temp_dir, file_path) = build(records)?;
 
         let file = File::options().read(true).write(true).open(&file_path)?;
@@ -156,7 +192,74 @@ mod tests {
         file.read_exact_at(&mut to_corrupt, offset)?;
         file.write_at(&[to_corrupt[0] ^ 0xFF], offset)?;
 
-        Ok((log, temp_dir))
+        Ok((log, temp_dir, file_path))
+    }
+
+    mod open {
+        use std::fs::metadata;
+
+        use super::*;
+
+        #[test]
+        fn valid_log_sets_write_offset_to_file_end() -> Result<()> {
+            let (_, _temp_dir, path) = build(&[b"payload"])?;
+            let file_len = metadata(&path)?.len();
+
+            assert_eq!(Log::open(path)?.write_offset, file_len);
+
+            Ok(())
+        }
+
+        #[test]
+        fn corrupted_record_refuses_open() -> Result<()> {
+            // offset 19 lands in second record crc
+            let (_, _temp_dir, path) =
+                build_and_corrupt_at_with(19, &[b"payload", b"payload", b"payload"])?;
+
+            let file_len_before_open = metadata(&path)?.len();
+
+            let err = Log::open(&path).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StoreError::Corrupt {
+                        offset: 15,
+                        reason: CorruptReason::ChecksumMismatch
+                    }
+                ),
+                "unexpected error {err:?}"
+            );
+
+            assert_eq!(metadata(path)?.len(), file_len_before_open);
+
+            Ok(())
+        }
+
+        #[test]
+        fn truncated_last_header_opens_and_trims() -> Result<()> {
+            let (log, _temp_dir, path) = build(&[b"payload", b"payload"])?;
+            log.file.set_len(18)?; // only write 3 bytes from last header then nothing
+
+            let mut log = Log::open(&path)?;
+            assert_eq!(log.write_offset, 15);
+            assert_eq!(metadata(path)?.len(), 15);
+            assert_eq!(log.append(b"payload")?, 15);
+
+            Ok(())
+        }
+
+        #[test]
+        fn truncated_last_content_opens_and_trims() -> Result<()> {
+            let (log, _temp_dir, path) = build(&[b"payload", b"payload"])?;
+            log.file.set_len(29)?; // remove 1 byte from the content
+
+            let mut log = Log::open(&path)?;
+            assert_eq!(log.write_offset, 15);
+            assert_eq!(metadata(path)?.len(), 15);
+            assert_eq!(log.append(b"payload")?, 15);
+
+            Ok(())
+        }
     }
 
     mod append {
@@ -223,7 +326,7 @@ mod tests {
 
         #[test]
         fn corrupted_len_record_returns_error() -> Result<()> {
-            let (log, _temp_dir) = build_and_corrupt_at(0)?;
+            let (log, _temp_dir, _) = build_and_corrupt_at(0)?;
 
             let err = log.read_at(0).unwrap_err();
 
@@ -243,7 +346,7 @@ mod tests {
 
         #[test]
         fn corrupted_crc_record_returns_error() -> Result<()> {
-            let (log, _temp_dir) = build_and_corrupt_at(4)?;
+            let (log, _temp_dir, _) = build_and_corrupt_at(4)?;
 
             let err = log.read_at(0).unwrap_err();
 
@@ -263,7 +366,7 @@ mod tests {
 
         #[test]
         fn corrupted_content_record_returns_error() -> Result<()> {
-            let (log, _temp_dir) = build_and_corrupt_at(8)?;
+            let (log, _temp_dir, _) = build_and_corrupt_at(8)?;
 
             let err = log.read_at(0).unwrap_err();
 
@@ -337,7 +440,7 @@ mod tests {
         #[test]
         fn over_records_with_2nd_corrupted_returns_valid_then_error() -> Result<()> {
             let records: &[&[u8]] = &[b"first", b"second"];
-            let (log, _temp_dir) = build_and_corrupt_at_with(17, records)?;
+            let (log, _temp_dir, _) = build_and_corrupt_at_with(17, records)?;
             let mut iter = log.iter();
 
             assert_eq!(
