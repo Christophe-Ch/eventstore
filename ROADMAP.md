@@ -14,10 +14,10 @@ The log stores opaque byte payloads. It knows nothing about events, streams or v
 - [x] **1a. Framing**
   `append(payload) -> offset`, `read_at(offset) -> payload`.
   Record layout, CRC verification, corruption detected in the length, CRC and payload fields.
-- [ ] **1b. `StoreError`**
+- [x] **1b. `StoreError`**
   Replace stringly-typed `io::Error` with an enum: `Io`, `Corrupt { offset, reason }`,
   `OffsetOutOfRange`, `PayloadTooLarge`. Tests assert on the variant instead of `is_err()`.
-- [ ] **1c. `iter` — recovery**
+- [x] **1c. `iter` — recovery**
   Scan from offset 0, yielding payloads until the file ends.
   Implements the recovery rule: a record that fails verification at the *tail* is a torn
   write (truncate, resume there); the same failure *anywhere else* is corruption (refuse to open).

@@ -93,9 +93,13 @@ not actually survive power loss.
 
 ## Write path invariants
 
-- The write offset is tracked in memory, set from the file length at open, and advanced
-  only *after* a write completes. After recovery truncates a torn tail, it points at the
-  verified end of the log, which is not necessarily the physical end of the file.
+- The write offset is tracked in memory and advanced only *after* a write completes. At
+  open it is not taken from the file length: the log is scanned from offset 0, every record
+  verified, and the offset set to the end of the last record that passed.
+- **Open may modify the file.** A torn tail is truncated at the offset where verification
+  failed, so after a successful open the write offset and the physical end of the file
+  always agree. Corruption is the other branch: open fails and the file is left untouched,
+  because that damage is not the store's to repair.
 - A record is built in a single buffer and written with one `write_all`. One syscall, and
   no crash can land between a header and its payload.
 - A partial write failure leaves the file and the in-memory offset inconsistent. The store
