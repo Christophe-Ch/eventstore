@@ -43,6 +43,8 @@ impl Log {
 
         self.file.write_all(&to_write)?;
 
+        self.sync()?;
+
         self.write_offset += to_write.len() as u64;
 
         Ok(record_offset)
@@ -89,6 +91,12 @@ impl Log {
             cursor: 0,
             done: false,
         }
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.file.sync_data()?;
+
+        Ok(())
     }
 
     fn is_within_log(&self, start: u64, length: u64) -> bool {

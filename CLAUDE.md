@@ -25,7 +25,7 @@ why the design is the way it is. The reasoning is the point of the
 project; the code is the exercise.
 
 Format spec: DESIGN.md (authoritative — format changes go there first)
-Milestones: ROADMAP.md (I'm on 1d)
+Milestones: ROADMAP.md (I'm on 2a)
 
 # Conventions
 - Unit tests next to the code, integration tests in tests/.

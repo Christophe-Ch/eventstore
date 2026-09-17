@@ -22,7 +22,7 @@ The log stores opaque byte payloads. It knows nothing about events, streams or v
   Implements the recovery rule: a record that fails verification at the *tail* is a torn
   write (truncate, resume there); the same failure *anywhere else* is corruption (refuse to open).
   First hand-written `Iterator`, first borrow that outlives the method call.
-- [ ] **1d. Durability**
+- [x] **1d. Durability**
   `sync_data` and when to call it. Only now does "append returned Ok" actually mean
   "survives power loss", and only now is the crash test meaningful.
 

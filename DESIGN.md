@@ -87,9 +87,38 @@ a replica. Failing loudly is the honest alternative.
 
 ## Durability
 
-**Currently unresolved.** `append` does not call `sync_data`, so a successful append means
-the bytes reached the kernel's page cache, not the disk. Until milestone 1d this store does
-not actually survive power loss.
+**`append` syncs before it returns.** A successful append means the bytes are on stable
+storage, not merely in the kernel's page cache. This is the store's central promise, and
+paying for it on every append is the only default that can be trusted without being
+documented.
+
+**`sync_data`, not `sync_all`.** `sync_data` (`fdatasync`) skips metadata the store does
+not care about — timestamps — but still flushes the metadata required to retrieve the
+data, which for an append-only file includes the new file length. A flush that left the
+length stale would put bytes past a stale EOF, which is worth nothing. On Apple targets
+Rust's `sync_data` issues `fcntl(F_FULLFSYNC)`, which flushes the drive's own write cache;
+a plain `fsync` there does not, and neither does `F_BARRIERFSYNC`, which only orders writes.
+
+**The offset advances after the sync, not before.** A failed sync leaves nothing
+acknowledged: `append` returns an error and the write offset still points at the last
+record known to be durable. Bytes may sit in the file past that point. What happens to them
+at the next open depends on how much of the record reached the disk: a complete, verifying
+record is accepted into the log at the offset it already had, and an incomplete one is
+truncated as a torn tail. Either outcome is consistent — the caller was told the append
+failed, and offsets already handed out do not move.
+
+**A sync failure should be treated as fatal to the store.** On Linux a failed `fsync` can
+mark the error consumed, so a retry returns success while the dirty pages are already gone
+— there is no way to find out afterwards which writes survived. The honest response is to
+stop using the log, not to retry. *Not currently enforced:* `append` returns the error and
+the `Log` remains usable.
+
+**The cost is the point of the knob.** One fsync is hundreds of microseconds on an SSD and
+milliseconds on a spinning disk, so syncing per append caps throughput at a few thousand
+writes a second regardless of CPU. `sync` is public so that a caller can eventually batch —
+append many records, sync once — which is the group-commit trade every production store
+exposes (Postgres `synchronous_commit`, Kafka `flush.ms`). Until that exists here, the safe
+default stands.
 
 ## Write path invariants
 
