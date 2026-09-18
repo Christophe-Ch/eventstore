@@ -8,6 +8,8 @@ pub enum StoreError {
     Corrupt { offset: u64, reason: CorruptReason },
     OffsetOutOfRange { offset: u64, log_len: u64 },
     PayloadTooLarge { len: usize },
+    EmptyStreamId,
+    StreamIdTooLong { len: usize },
 }
 
 impl Display for StoreError {
@@ -19,6 +21,8 @@ impl Display for StoreError {
                 write!(f, "offset {offset} out of range for log length {log_len}")
             }
             StoreError::PayloadTooLarge { len } => write!(f, "payload too large ({len})"),
+            StoreError::EmptyStreamId => write!(f, "empty stream id"),
+            StoreError::StreamIdTooLong { len } => write!(f, "stream id too long ({len})"),
         }
     }
 }

@@ -134,10 +134,90 @@ default stands.
 - A partial write failure leaves the file and the in-memory offset inconsistent. The store
   is unusable until reopened, where recovery truncates the mess. Not currently enforced.
 
+## Event frame
+
+Everything above describes the **log**, which stores opaque byte payloads and knows nothing
+else. This section describes the layer above it: what the store puts *inside* a payload.
+The log is unchanged by it — same 8-byte header, same CRC, same recovery rule.
+
+```
+offset  size  field
+------  ----  ---------------------------------------------------
+     0     2  stream_len  u16, byte length of stream_id
+     2     8  version     u64, 0-based position within the stream
+    10     n  stream_id   UTF-8, n = stream_len
+  10+n   ...  data        opaque bytes, runs to the end of the record
+```
+
+Fixed overhead is 10 bytes per event.
+
+**Why inside the payload rather than in the record header.** The log's contract is framing,
+checksums and recovery over bytes it does not interpret; streams are a concept of the layer
+above. Keeping them apart means the record header stays fixed at 8 bytes and every rule in
+*Reading a record* keeps policing exactly one variable-length field. The frame is covered by
+the record CRC like any other payload byte, so a corrupted stream id is caught by machinery
+that already exists. The cost — a parse on every read — is reading two integers out of a
+slice already in memory.
+
+**Why the version is stored, when it is derivable.** The version of an event is its position
+in that stream's list of offsets, so an index can always compute it. Writing it down anyway
+makes the record self-describing, which is what lets a rebuild *assert* that a stream's
+versions are contiguous instead of assuming it. An index is a derived structure; the log has
+to be able to prove it wrong.
+
+**Versions are 0-based and contiguous.** Within a stream, versions are `0, 1, 2, …` with no
+gaps, ascending in log order. So the index lookup *is* the version — `offsets[n]` holds
+version `n` — with no arithmetic anywhere. "The stream does not exist" is therefore not a
+version number; it is the absence of the stream, and the concurrency check models it as its
+own case rather than as a magic zero.
+
+**`stream_len` is a `u16`.** Stream ids are aggregate identifiers, not documents; 64 KiB is
+already absurd, and Kafka caps topic names at 249 bytes. A `u32` would write two extra zero
+bytes on every event forever. A zero-length stream id is invalid in both directions: it is
+rejected at encode and treated as a malformed frame at decode.
+
+**`data` has no length prefix.** The record's own length field already bounds the payload, so
+the data simply runs to the end. A second length would be a value that can disagree with the
+first one — a thing to validate rather than a thing to trust. Empty `data` is legal: an event
+whose occurrence is its entire meaning still has a stream and a version.
+
+**No format tag.** A version byte at the front of the frame would be cheap insurance, but it
+would only ever cover this frame. If the on-disk format changes incompatibly, the record
+layout and the index are equally affected, and the honest answer is a file-level format
+version decided once for the whole store — not a per-record byte that protects one of the
+three things that would need to move together.
+
+### Decoding a frame
+
+Paranoid in the same way, and for the same reason: the bytes may be anything.
+
+1. The payload is at least 10 bytes. Otherwise the frame is truncated.
+2. Decode `stream_len` and `version`.
+3. Check `10 + stream_len <= payload.len()`. A declared id longer than the payload is a
+   malformed frame, checked before the id is read.
+4. `stream_len` is non-zero.
+5. The stream id bytes are valid UTF-8.
+6. `data` is whatever remains, possibly empty.
+
+A decoder sees a slice of bytes and does not know which record they came from, so it cannot
+name an offset. It reports *why* the frame is malformed and nothing more; the caller, which
+knows the offset, is what turns that into corruption reported at a position. This is the same
+split as *Reading a record*: judging bytes and locating them are two different jobs.
+
+### Worked example
+
+Stream `orders-1`, version 3, data `hi`:
+
+```
+08 00                    stream_len = 8
+03 00 00 00 00 00 00 00  version = 3
+6f 72 64 65 72 73 2d 31  "orders-1"
+68 69                    "hi"
+```
+
+20 bytes, which the log then stores as a 28-byte record.
+
 ## Open questions
 
-- Where stream id and version live: a larger record header, or a framed structure inside
-  the payload. The second keeps the log ignorant of what it stores, which is the stated
-  goal — but costs a parse on every read.
 - Whether the log stays one file or splits into segments, and what that does to offsets as
   permanent addresses.
