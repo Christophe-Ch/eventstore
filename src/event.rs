@@ -4,9 +4,9 @@ use crate::error::{Result, StoreError};
 
 #[derive(Debug, PartialEq)]
 pub struct Event {
-    stream: String,
-    version: u64,
-    data: Vec<u8>,
+    pub(crate) stream: String,
+    pub(crate) version: u64,
+    pub(crate) data: Vec<u8>,
 }
 
 const STREAM_LEN_LEN: usize = 2;
@@ -78,7 +78,7 @@ impl Event {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MalformedEvent {
     TooShort,
     StreamIdLengthZero,

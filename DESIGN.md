@@ -217,6 +217,46 @@ Stream `orders-1`, version 3, data `hi`:
 
 20 bytes, which the log then stores as a 28-byte record.
 
+## The stream index
+
+The log answers "what is at this offset". Loading an aggregate asks the opposite question —
+"where are the events of this stream" — and answering it by scanning the whole log costs
+O(total events in the store) per load, on the hottest path there is. So the store keeps a
+map from stream id to that stream's offsets, in log order.
+
+**The index is derived.** It holds nothing that cannot be recomputed by replaying the log
+from offset 0, which is exactly how it is built: `open` scans every record, decodes its
+frame, and appends the offset to that stream's list. Nothing is persisted, so there is no
+second copy to reconcile — the index either exists in memory, correct by construction, or it
+does not exist at all. What a rebuild can still find is the log contradicting *itself*, and
+that is not a disagreement to resolve in anyone's favour: it is damage, and open fails.
+
+**`Vec<offset>` per stream, and the position is the version.** Versions are 0-based and
+contiguous, so `offsets[n]` holds version `n` and the last version is `len() - 1`. That
+subtraction is only safe because a stream's list is never empty — an entry is created only
+together with the offset that justifies it. A stream with no events is not a stream with an
+empty list; it is a stream that is absent from the map, which is what makes "the stream does
+not exist" representable without a magic version number.
+
+**Contiguity is asserted, not assumed.** Each record's frame carries its version, so the
+rebuild can compare what the log says against the position it is about to assign. A mismatch
+in either direction is rejected: a version ahead means events are missing, a version behind
+means one was written twice. The index cannot be trusted to check itself, and this is the
+only place the written version earns its eight bytes.
+
+**A bad frame is corruption, never a torn tail.** A record that reaches the frame decoder has
+already passed its CRC, which means its bytes are exactly the bytes handed to `write_all`. An
+interrupted write cannot produce them. So a frame that fails to decode, or whose version is
+not the next one for its stream, is reported as corruption at that record's offset — even
+when it is the last record in the file, where a CRC failure would instead have been truncated
+as a torn write. The two failures look alike at the tail and mean opposite things: one is a
+write that never happened, the other is a write that happened and is wrong.
+
+**Rebuilding at open is a cost that grows with the log.** Every open reads and decodes every
+record. That is the price of having no persistent index, and it is the problem milestone 3
+exists to solve; the replay path stays regardless, because a persistent index that disagrees
+with the log has to be thrown away and recomputed from it.
+
 ## Open questions
 
 - Whether the log stays one file or splits into segments, and what that does to offsets as

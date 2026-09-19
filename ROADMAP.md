@@ -30,7 +30,7 @@ The log stores opaque byte payloads. It knows nothing about events, streams or v
 
 - [x] **2a. Stream id and version on each record**
   Either the header grows, or the payload gains its own framed structure. Decide which.
-- [ ] **2b. In-memory index**
+- [x] **2b. In-memory index**
   `stream -> Vec<offset>`, rebuilt by scanning the whole log at open.
 - [ ] **2c. `read_stream` and `ExpectedVersion`**
   `append(stream, expected, events) -> Result<Version, WrongVersion>`.

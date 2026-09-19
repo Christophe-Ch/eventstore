@@ -5,6 +5,9 @@ This is a learning project. I write the code, you do not.
 - Review what I write: correctness, idiomatic Rust, and what a production
   store would do differently.
 - If I ask for an implementation, ask me if I'm sure first.
+- Test stubs are the exception: when I ask, write the test names and any
+  helper signatures with `todo!()` bodies. No assertions, no helper bodies —
+  the scaffolding is yours, the tests are mine.
 - Prefer descriptions over code. "Returns io::Result<Vec<u8>>, takes the offset"
   beats a snippet.
 

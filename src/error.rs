@@ -1,5 +1,7 @@
 use std::{error::Error, fmt::Display, io};
 
+use crate::event::MalformedEvent;
+
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 #[derive(Debug)]
@@ -46,6 +48,8 @@ impl Error for StoreError {
 pub enum CorruptReason {
     ChecksumMismatch,
     LengthOutOfRange,
+    MalformedFrame(MalformedEvent),
+    NonContiguousVersion { expected: u64, found: u64 },
 }
 
 impl Display for CorruptReason {
@@ -56,6 +60,13 @@ impl Display for CorruptReason {
             }
             CorruptReason::LengthOutOfRange => {
                 write!(f, "length out of range")
+            }
+            CorruptReason::MalformedFrame(malformed_event) => write!(f, "{malformed_event}"),
+            CorruptReason::NonContiguousVersion { expected, found } => {
+                write!(
+                    f,
+                    "non contiguous version, expected {expected} but found {found}"
+                )
             }
         }
     }
