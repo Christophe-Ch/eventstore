@@ -1,7 +1,10 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, iter::FusedIterator, path::Path, slice::Iter};
 
 use crate::{
-    error::{CorruptReason, Result, StoreError},
+    error::{
+        CorruptReason::{self, MalformedFrame},
+        Result, StoreError,
+    },
     event::Event,
     log::Log,
 };
@@ -49,6 +52,60 @@ impl Store {
         self.index
             .get(stream)
             .map(|offsets| offsets.len() as u64 - 1)
+    }
+
+    pub fn read_stream(&self, stream: &str) -> StreamIter<'_> {
+        StreamIter::new(
+            &self.log,
+            self.index
+                .get(stream)
+                .map_or([].as_slice(), |offsets| offsets.as_slice())
+                .iter(),
+        )
+    }
+}
+
+pub struct StreamIter<'a> {
+    log: &'a Log,
+    offsets: Iter<'a, u64>,
+    failed: bool,
+}
+
+impl<'a> StreamIter<'a> {
+    fn new(log: &'a Log, offsets: Iter<'a, u64>) -> Self {
+        StreamIter {
+            log,
+            offsets,
+            failed: false,
+        }
+    }
+}
+
+impl FusedIterator for StreamIter<'_> {}
+impl Iterator for StreamIter<'_> {
+    type Item = Result<Event>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+
+        match self.offsets.next() {
+            None => None,
+            Some(offset) => Some(
+                self.log
+                    .read_at(*offset)
+                    .and_then(|bytes| {
+                        Event::decode(&bytes).map_err(|err| StoreError::Corrupt {
+                            offset: *offset,
+                            reason: MalformedFrame(err),
+                        })
+                    })
+                    .inspect_err(|_| {
+                        self.failed = true;
+                    }),
+            ),
+        }
     }
 }
 
@@ -255,6 +312,138 @@ mod tests {
             let (_temp_dir, file_path) = build(&[Event::new(String::from("orders-1"), 0, vec![])])?;
 
             assert_eq!(Store::open(file_path)?.stream_version("accounts-1"), None);
+
+            Ok(())
+        }
+    }
+
+    mod read_stream {
+        use std::{fs::File, os::unix::fs::FileExt};
+
+        use super::*;
+
+        /// Flips a byte inside the record at `record_offset`, through a handle
+        /// the `Store` does not own, so damage appears after the rebuild.
+        fn corrupt_payload_at(file_path: &std::path::Path, record_offset: u64) -> Result<()> {
+            let file = File::options().write(true).read(true).open(file_path)?;
+            let mut byte = [0u8; 1];
+            let payload_offset = record_offset + 8;
+            file.read_exact_at(&mut byte, payload_offset)?;
+            file.write_all_at(&[byte[0] ^ 0xFF], payload_offset)?;
+
+            Ok(())
+        }
+
+        #[test]
+        fn returns_only_the_requested_stream() -> Result<()> {
+            let events = [
+                Event::new(String::from("orders-1"), 0, b"hi".to_vec()),
+                Event::new(String::from("accounts-1"), 0, vec![]),
+                Event::new(String::from("orders-1"), 1, b"hello".to_vec()),
+            ];
+            let orders_events = [
+                Event::new(String::from("orders-1"), 0, b"hi".to_vec()),
+                Event::new(String::from("orders-1"), 1, b"hello".to_vec()),
+            ];
+            let (_temp_dir, file_path) = build(&events)?;
+
+            let store = Store::open(file_path)?;
+            let orders_stream = store.read_stream("orders-1");
+
+            assert_eq!(orders_stream.collect::<Result<Vec<_>>>()?, orders_events);
+
+            Ok(())
+        }
+
+        #[test]
+        fn is_empty_for_an_unknown_stream() -> Result<()> {
+            let events = [Event::new(String::from("orders-1"), 0, b"hi".to_vec())];
+            let (_temp_dir, file_path) = build(&events)?;
+
+            let store = Store::open(file_path)?;
+            let accounts_stream = store.read_stream("accounts-1");
+
+            assert!(accounts_stream.collect::<Result<Vec<_>>>()?.is_empty());
+
+            Ok(())
+        }
+
+        #[test]
+        fn reads_an_event_with_no_data() -> Result<()> {
+            let events = [Event::new(String::from("orders-1"), 0, vec![])];
+            let (_temp_dir, file_path) = build(&events)?;
+
+            let store = Store::open(file_path)?;
+            let mut orders_stream = store.read_stream("orders-1");
+
+            assert!(orders_stream.next().unwrap()?.data.is_empty());
+
+            Ok(())
+        }
+
+        #[test]
+        fn reports_corruption_at_the_offset() -> Result<()> {
+            let (_temp_dir, file_path) = build(&[
+                Event::new(String::from("orders-1"), 0, vec![]),
+                Event::new(String::from("orders-1"), 1, vec![]),
+            ])?;
+
+            let store = Store::open(&file_path)?;
+            let mut orders_stream = store.read_stream("orders-1");
+
+            corrupt_payload_at(&file_path, 26)?;
+
+            orders_stream.next();
+            let err = orders_stream.next().unwrap().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StoreError::Corrupt {
+                        offset: 26,
+                        reason: CorruptReason::ChecksumMismatch
+                    }
+                ),
+                "unexpected error {err:?}"
+            );
+
+            Ok(())
+        }
+
+        #[test]
+        fn yields_nothing_after_an_error() -> Result<()> {
+            let (_temp_dir, file_path) = build(&[
+                Event::new(String::from("orders-1"), 0, vec![]),
+                Event::new(String::from("orders-1"), 1, vec![]),
+            ])?;
+
+            let store = Store::open(&file_path)?;
+            let mut orders_stream = store.read_stream("orders-1");
+
+            corrupt_payload_at(&file_path, 0)?;
+
+            assert!(orders_stream.next().unwrap().is_err());
+            assert!(orders_stream.next().is_none());
+
+            Ok(())
+        }
+
+        #[test]
+        fn does_not_read_past_what_the_caller_takes() -> Result<()> {
+            let events = [
+                Event::new(String::from("orders-1"), 0, vec![]),
+                Event::new(String::from("orders-1"), 1, vec![]),
+            ];
+            let (_temp_dir, file_path) = build(&events)?;
+
+            let store = Store::open(&file_path)?;
+            let orders_stream = store.read_stream("orders-1");
+
+            corrupt_payload_at(&file_path, 26)?;
+
+            assert_eq!(
+                orders_stream.take(1).collect::<Result<Vec<_>>>()?,
+                &events[..1]
+            );
 
             Ok(())
         }

@@ -257,6 +257,58 @@ record. That is the price of having no persistent index, and it is the problem m
 exists to solve; the replay path stays regardless, because a persistent index that disagrees
 with the log has to be thrown away and recomputed from it.
 
+## Reading a stream
+
+`read_stream` answers the question the index exists for: give me the events of this
+stream, in order. It reads the stream's offset list and fetches each record; nothing is
+written, no invariant is new, and the on-disk format is untouched.
+
+**An absent stream yields no events, not an error.** Every aggregate's first command loads
+a stream that does not exist yet — the handler reads nothing, decides, and appends the
+event that creates it. That is the birth path, not a failure. The distinction the caller
+does need, "is this stream new?", belongs to the concurrency check, which models it as its
+own case and reads it from the index directly. A read has no use for it, so absent and
+empty behave identically here.
+
+**The read path is lazy: it returns an iterator, not a `Vec`.** Folding an aggregate often
+stops early, and a stream can be arbitrarily long; materialising every event before the
+caller looks at the first one allocates work that may never be needed. Collecting into a
+`Vec` stays one call away for the callers that want it.
+
+**Laziness saves memory, not I/O.** Unlike the recovery scan, which walks the file front to
+back, a stream read is one positioned read per event at scattered offsets. The iterator
+avoids holding them all at once; it does not make the reads cheaper. What makes them
+cheaper is fewer of them — snapshots, or a layout that keeps a stream's records together —
+and neither exists here.
+
+**The iterator borrows the store for as long as it lives.** That is not incidental: it is
+the read being honest about what it is. A lazy read over a log that can still be appended
+to is not a snapshot, and the borrow makes the overlap impossible to write rather than
+merely wrong. A caller that wants both collects first and lets the borrow end. Production
+stores face the same question and answer it with versioned reads — an iterator that sees
+the log as of the moment it was opened — which costs machinery this store does not have.
+
+**Failure is per event, not per call.** Opening verified every record, but the file is
+still a file: the store does not own the only handle to it, and damage can appear after the
+rebuild. So each item is a `Result` — a failed checksum or a malformed frame is reported as
+corruption at that record's offset, exactly as during recovery.
+
+**A corrupt event ends the read.** Once an item is an error the iterator yields nothing
+further, and unlike the recovery scan this is a choice rather than a constraint. A record
+the log cannot decode costs the scan the position of the next one, so it has nowhere to
+continue to; a stream read has every offset in hand already and could skip the bad record
+and carry on. It does not, because the caller folding a stream into an aggregate would then
+be handed a state assembled from a stream with a hole in it. A caller that checks its
+errors — collecting into a single `Result`, say — sees no difference either way. One that
+discards them sees a short stream instead of a wrong answer, which is the failure worth
+having.
+
+**Contiguity is not re-checked on read.** The rebuild already asserted, against the versions
+written in the frames, that the offset list is the stream in order. Re-asserting it here
+would be the index verifying itself from the same data it was built from, which proves
+nothing. The log is the only thing that can contradict the index, and open is where it gets
+to.
+
 ## Open questions
 
 - Whether the log stays one file or splits into segments, and what that does to offsets as

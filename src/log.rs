@@ -1,5 +1,6 @@
 use crate::error::{CorruptReason, Result, StoreError};
 use crate::record::{self, checksum};
+use std::iter::FusedIterator;
 use std::{fs::File, io::Write, os::unix::fs::FileExt, path::Path};
 
 const HEADER_LEN: u64 = 8;
@@ -144,6 +145,7 @@ pub struct RecordIter<'a> {
     done: bool,
 }
 
+impl FusedIterator for RecordIter<'_> {}
 impl Iterator for RecordIter<'_> {
     type Item = Result<(u64, Vec<u8>)>;
 

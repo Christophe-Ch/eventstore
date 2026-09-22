@@ -32,10 +32,18 @@ The log stores opaque byte payloads. It knows nothing about events, streams or v
   Either the header grows, or the payload gains its own framed structure. Decide which.
 - [x] **2b. In-memory index**
   `stream -> Vec<offset>`, rebuilt by scanning the whole log at open.
-- [ ] **2c. `read_stream` and `ExpectedVersion`**
-  `append(stream, expected, events) -> Result<Version, WrongVersion>`.
-  Batch append must be atomic: all events visible or none.
-  The concurrency guard exists from here on.
+- [x] **2c. `read_stream`**
+  `read_stream(stream) -> Vec<Event>`, in stream order, via the 2b index.
+  A pure read path: no new invariant, no format change.
+- [ ] **2d. `ExpectedVersion`**
+  `append(stream, expected, event) -> Result<Version, WrongVersion>`, one event.
+  Current version is the index entry count. API and validation only — nothing
+  on disk changes. The concurrency guard exists from here on.
+- [ ] **2e. Batch append atomicity**
+  Generalise to `events`: all visible or none, across a crash.
+  This one touches the format and the 1c recovery rule — a valid record at the
+  tail is no longer enough, a half-written batch must stay invisible. Something
+  has to mark a batch complete.
 
 ## 3. Persistent index
 
@@ -81,5 +89,5 @@ Deliberately, and permanently for this project:
 Milestones 1 and 2 are the project. 3 and 4 turn it into a system. 5 is optional.
 
 1d and 3 are where this kind of project usually stalls — measuring fsync properly is
-fiddly, and persistent indexes are genuinely hard. Reaching 2c with passing tests is
+fiddly, and persistent indexes are genuinely hard. Reaching 2e with passing tests is
 already a real piece of storage engine.
