@@ -309,6 +309,57 @@ would be the index verifying itself from the same data it was built from, which 
 nothing. The log is the only thing that can contradict the index, and open is where it gets
 to.
 
+## Appending an event
+
+`append` is the only write, and it is where the store stops being a log with a map over it
+and starts enforcing a rule of its own: an event is accepted only if the writer's view of
+the stream is still current. Nothing on disk changes for this — same record, same frame.
+What changes is that a write can now be refused for a reason that is not damage.
+
+**Why the check exists at all.** Two handlers load `orders-1` at version 4, each decides
+against the state it read, each appends. Both writes are individually valid and the result
+is a stream whose version 6 was computed as though version 5 never happened — an invariant
+checked against a state that no longer exists. The guard is optimistic: no lock is held
+while the handler thinks, and the conflict is detected at write time, where the loser
+re-reads and retries. It is the same trade as `UPDATE … WHERE version = ?` and checking the
+affected row count.
+
+**The expectation is an enum, not a version number.** `NoStream` and `Exact(n)`. The index
+section already established that an absent stream is not a stream at version zero, and the
+same reasoning applies to the expectation: creating an aggregate and updating one are
+different intents. Collapsing them into a number means two concurrent creates both succeed,
+which is the exact case the guard exists to prevent. `Any` — a write with no expectation —
+is deliberately absent; every one of those is a write that skipped the check, and nothing
+here needs one yet.
+
+**The store assigns the version; the caller cannot.** `append` takes the stream, the
+expectation and the payload — never a version. The version written is the stream's next
+one, which is the length of its offset list. Contiguity is therefore an invariant of the
+write path rather than something the rebuild merely discovers afterwards; the assertion at
+open exists to catch a log that was damaged or written by something else, not to catch this
+code.
+
+**The index is updated only after the append is durable.** The order is: check, encode,
+append (which syncs), then push the offset. An index entry for a write that failed is an
+offset pointing at nothing, and worse, the next append would compute its version from a
+list containing it — assigning a version the log never received. The in-memory state must
+never run ahead of the disk. A rejected append is stronger still: it returns before the log
+is touched at all, so a conflict writes nothing by construction.
+
+**A conflict is not an error about the store.** Every other `StoreError` reports a bug, a
+bad argument, or damage. This one reports an ordinary outcome that a correct caller will
+hit under concurrency and handle by retrying. It shares the enum for now because the store
+is small; production systems separate the two, because "retry this" and "the log is severed"
+belong in different parts of a caller's code.
+
+**The check and the write are inseparable only because of `&mut self`.** Reading the current
+version and appending against it is a read-modify-write, and exposing the read as its own
+public call would invite exactly the race the guard prevents. Here the exclusive borrow makes
+that impossible to write: no caller can hold the result of a read across the append. That is
+a property of a single-threaded embedded store, not of the design. Concurrent writers would
+need a per-stream lock, or a single writer thread the appends are funnelled through — and
+the window would be real until one of those exists.
+
 ## Open questions
 
 - Whether the log stays one file or splits into segments, and what that does to offsets as

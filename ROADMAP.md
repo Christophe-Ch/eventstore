@@ -35,7 +35,7 @@ The log stores opaque byte payloads. It knows nothing about events, streams or v
 - [x] **2c. `read_stream`**
   `read_stream(stream) -> Vec<Event>`, in stream order, via the 2b index.
   A pure read path: no new invariant, no format change.
-- [ ] **2d. `ExpectedVersion`**
+- [x] **2d. `ExpectedVersion`**
   `append(stream, expected, event) -> Result<Version, WrongVersion>`, one event.
   Current version is the index entry count. API and validation only — nothing
   on disk changes. The concurrency guard exists from here on.

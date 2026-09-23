@@ -7,11 +7,25 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Debug)]
 pub enum StoreError {
     Io(io::Error),
-    Corrupt { offset: u64, reason: CorruptReason },
-    OffsetOutOfRange { offset: u64, log_len: u64 },
-    PayloadTooLarge { len: usize },
+    Corrupt {
+        offset: u64,
+        reason: CorruptReason,
+    },
+    OffsetOutOfRange {
+        offset: u64,
+        log_len: u64,
+    },
+    PayloadTooLarge {
+        len: usize,
+    },
     EmptyStreamId,
-    StreamIdTooLong { len: usize },
+    StreamIdTooLong {
+        len: usize,
+    },
+    UnexpectedVersion {
+        expected: Option<u64>,
+        got: Option<u64>,
+    },
 }
 
 impl Display for StoreError {
@@ -25,6 +39,18 @@ impl Display for StoreError {
             StoreError::PayloadTooLarge { len } => write!(f, "payload too large ({len})"),
             StoreError::EmptyStreamId => write!(f, "empty stream id"),
             StoreError::StreamIdTooLong { len } => write!(f, "stream id too long ({len})"),
+            StoreError::UnexpectedVersion { expected, got } => match (expected, got) {
+                (None, Some(got)) => write!(f, "no stream expected but found version {got}"),
+                (Some(expected), Some(got)) => {
+                    write!(f, "expected version {expected} but found version {got}")
+                }
+                (Some(expected), None) => {
+                    write!(f, "expected version {expected} but stream does not exist")
+                }
+                _ => {
+                    write!(f, "no stream expected and got no stream")
+                }
+            },
         }
     }
 }
